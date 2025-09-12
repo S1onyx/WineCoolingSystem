@@ -26,7 +26,7 @@ OneWire oneWire(PIN_ONEWIRE);
 DallasTemperature sensors(&oneWire);
 DeviceAddress dsAddr;
 
-// --------- Regelung ---------
+// --------- Regelung / Anzeige ---------
 constexpr float SET_STEP = 0.1f;
 constexpr float SET_MIN = -20.0f;
 constexpr float SET_MAX = 80.0f;
@@ -38,49 +38,40 @@ float lastTempRaw = NAN; // unkalibriert
 float lastTemp = NAN;    // kalibriert
 bool relayState = false;
 
+// --------- AUTO: Zeit-Pulsbetrieb mit Cooldown (10 s offen, mind. 120 s zu)
+// ---------
+constexpr unsigned long OPEN_DURATION_MS = 10UL * 1000UL; // 10 s
+constexpr unsigned long COOLDOWN_MS = 120UL * 1000UL;     // 2 min
+
+enum class AutoState { OPEN, CLOSED };
+AutoState autoState = AutoState::CLOSED;
+unsigned long stateStartedAt = 0; // Zeitstempel Start des aktuellen Zustands
+unsigned long lastOpenAt = 0;     // Zeitstempel Beginn der letzten Öffnung
+
 // =====================================================================
 //                          KALIBRIERUNG IM CODE
 // =====================================================================
-// Trage hier deine Kalibrierpunkte ein. Bis zu 4 Punkte werden unterstützt.
-// Beispiel (auskommentiert) zeigt, wie es aussehen könnte.
-// Wichtig: CAL_RAW und CAL_REF müssen aufsteigend nach Temperatur sortiert
-// sein.
-
-// Beispiel: 2-Punkt-Kalibrierung (Offset+Steigung):
-// static const int   CAL_COUNT = 2;
-// static const float CAL_RAW[] = {  0.0f, 30.0f };  // was der Sensor zeigt
-// static const float CAL_REF[] = {  0.0f, 30.2f };  // echte Referenz
-
-// Beispiel: 3-4 Punkte über relevanten Bereich:
-// static const int   CAL_COUNT = 4;
-// static const float CAL_RAW[] = {  0.0f, 10.0f, 20.0f, 30.0f };
-// static const float CAL_REF[] = { -0.1f, 10.1f, 20.0f, 30.2f };
-
-// Default: keine Kalibrierung (Identität):
+// Default: keine Kalibrierung (Identität)
 static const int CAL_COUNT = 0;
 static const float CAL_RAW[] = {};
 static const float CAL_REF[] = {};
 
-// Stückweise lineare Kalibrierung
 float applyCalibration(float raw) {
   if (isnan(raw) || CAL_COUNT <= 0)
     return raw;
-  if (CAL_COUNT == 1) {
-    return raw + (CAL_REF[0] - CAL_RAW[0]); // nur Offset
-  }
-  // Unterhalb des kleinsten Kalibrierpunkts -> extrapoliere mit erstem Segment
+  if (CAL_COUNT == 1)
+    return raw + (CAL_REF[0] - CAL_RAW[0]);
+
   if (raw <= CAL_RAW[0]) {
     float x1 = CAL_RAW[0], x2 = CAL_RAW[1];
     float y1 = CAL_REF[0], y2 = CAL_REF[1];
     return y1 + (raw - x1) * (y2 - y1) / (x2 - x1);
   }
-  // Oberhalb des größten Kalibrierpunkts -> extrapoliere mit letztem Segment
   if (raw >= CAL_RAW[CAL_COUNT - 1]) {
     float x1 = CAL_RAW[CAL_COUNT - 2], x2 = CAL_RAW[CAL_COUNT - 1];
     float y1 = CAL_REF[CAL_COUNT - 2], y2 = CAL_REF[CAL_COUNT - 1];
     return y1 + (raw - x1) * (y2 - y1) / (x2 - x1);
   }
-  // Innerhalb → passendes Segment finden
   for (int i = 0; i < CAL_COUNT - 1; ++i) {
     if (raw >= CAL_RAW[i] && raw <= CAL_RAW[i + 1]) {
       float x1 = CAL_RAW[i], x2 = CAL_RAW[i + 1];
@@ -88,7 +79,7 @@ float applyCalibration(float raw) {
       return y1 + (raw - x1) * (y2 - y1) / (x2 - x1);
     }
   }
-  return raw; // sollte nicht passieren
+  return raw;
 }
 
 // =====================================================================
@@ -126,7 +117,66 @@ void readTemperatureRaw() {
   lastTempRaw = (t > -127.0f && t < 125.0f) ? t : NAN;
 }
 
-void controlLogic(Mode mode) {
+// --------- AUTO-Helfer ---------
+inline bool cooldownOver(unsigned long now) {
+  return (now - lastOpenAt) >= COOLDOWN_MS;
+}
+inline bool shouldOpenNow() {
+  if (isnan(lastTemp))
+    return false;
+  return lastTemp < (setpoint - HYST * 0.5f);
+}
+void startOpen(unsigned long now) {
+  autoState = AutoState::OPEN;
+  stateStartedAt = now;
+  lastOpenAt = now; // Cooldown ab Start der Öffnung messen
+  relayWrite(true);
+}
+void startClosed(unsigned long now) {
+  autoState = AutoState::CLOSED;
+  stateStartedAt = now;
+  relayWrite(false);
+}
+
+// --------- Steuerlogik ---------
+void controlLogicTimedAuto(bool modeJustEntered) {
+  unsigned long now = millis();
+
+  if (modeJustEntered) {
+    // Beim Eintritt in AUTO sofortiges Öffnen erlauben, wenn es zu kalt ist:
+    // Cooldown künstlich abgelaufen setzen
+    lastOpenAt = (now >= COOLDOWN_MS) ? (now - COOLDOWN_MS) : 0;
+    startClosed(now);
+
+    // Direkt prüfen: zu kalt? -> sofort öffnen
+    if (shouldOpenNow() && cooldownOver(now)) {
+      startOpen(now);
+    }
+    return;
+  }
+
+  switch (autoState) {
+  case AutoState::CLOSED: {
+    // Dauerhaft messen: sobald zu kalt UND Cooldown vorbei -> sofort öffnen
+    if (cooldownOver(now) && shouldOpenNow()) {
+      startOpen(now);
+    }
+    // sonst geschlossen lassen
+    break;
+  }
+
+  case AutoState::OPEN: {
+    // Immer mindestens 10 s offen bleiben (nie früher schließen)
+    bool timeUp = (now - stateStartedAt) >= OPEN_DURATION_MS;
+    if (timeUp) {
+      startClosed(now);
+    }
+    break;
+  }
+  }
+}
+
+void controlLogic(Mode mode, bool modeJustEntered) {
   switch (mode) {
   case Mode::OFF:
     relayWrite(false);
@@ -135,14 +185,7 @@ void controlLogic(Mode mode) {
     relayWrite(true);
     break;
   case Mode::AUTO:
-    if (isnan(lastTemp)) {
-      relayWrite(false);
-      break;
-    }
-    if (!relayState && lastTemp > setpoint + HYST * 0.5f)
-      relayWrite(true);
-    if (relayState && lastTemp < setpoint - HYST * 0.5f)
-      relayWrite(false);
+    controlLogicTimedAuto(modeJustEntered);
     break;
   }
 }
@@ -290,6 +333,8 @@ void setup() {
 void loop() {
   static unsigned long lastTempPoll = 0;
   static unsigned long lastDraw = 0;
+  static Mode lastMode = Mode::AUTO;
+
   unsigned long now = millis();
 
   // Buttons (Setpoint)
@@ -297,16 +342,18 @@ void loop() {
   changed |= handleButton(btnUp, +SET_STEP);
   changed |= handleButton(btnDown, -SET_STEP);
 
-  // Temperatur 1x/s lesen und kalibrieren
+  // Temperatur 1x/s lesen und kalibrieren (dauerhaft messen)
   if (now - lastTempPoll > 1000) {
     readTemperatureRaw();
     lastTemp = applyCalibration(lastTempRaw);
     lastTempPoll = now;
   }
 
-  // Modus/Relais
+  // Modus & Regelung
   Mode mode = readModeSwitch();
-  controlLogic(mode);
+  bool modeJustEntered = (mode != lastMode);
+  controlLogic(mode, modeJustEntered);
+  lastMode = mode;
 
   // Anzeige
   if (changed || now - lastDraw > 200) {
