@@ -48,6 +48,15 @@ AutoState autoState = AutoState::CLOSED;
 unsigned long stateStartedAt = 0; // Zeitstempel Start des aktuellen Zustands
 unsigned long lastOpenAt = 0;     // Zeitstempel Beginn der letzten Öffnung
 
+// --------- DISPLAY: Auto-Off nach Inaktivität (2 min) ---------
+constexpr unsigned long DISPLAY_ON_TIMEOUT_MS = 120UL * 1000UL; // 2 min
+bool displayIsOn = true;
+unsigned long lastInteractionAt = 0;
+
+void displayWake();
+void displaySleep();
+void updateDisplayPower(unsigned long now);
+
 // =====================================================================
 //                          KALIBRIERUNG IM CODE
 // =====================================================================
@@ -83,6 +92,32 @@ float applyCalibration(float raw) {
 }
 
 // =====================================================================
+//                         DISPLAY POWER CONTROL
+// =====================================================================
+void displayWake() {
+  if (!displayIsOn) {
+    // Einschalten des Panels
+    display.ssd1306_command(SSD1306_DISPLAYON);
+    displayIsOn = true;
+    // optional: Display puffern leeren & sofort neu zeichnen übernimmt loop()
+  }
+  lastInteractionAt = millis();
+}
+
+void displaySleep() {
+  if (displayIsOn) {
+    display.ssd1306_command(SSD1306_DISPLAYOFF);
+    displayIsOn = false;
+  }
+}
+
+void updateDisplayPower(unsigned long now) {
+  if (displayIsOn) {
+    if (now - lastInteractionAt >= DISPLAY_ON_TIMEOUT_MS) {
+      displaySleep();
+    }
+  }
+}
 
 Mode readModeSwitch() {
   bool a = digitalRead(PIN_MODE_A);
@@ -224,6 +259,9 @@ void drawSplash() {
 }
 
 void drawMain(Mode m, float sp, float t, bool relay) {
+  if (!displayIsOn) {
+    return; // Nichts zeichnen, wenn Display schlafend ist
+  }
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
 
@@ -287,6 +325,8 @@ bool handleButton(Btn &b, float delta) {
   bool changed = false;
 
   if (!level && b.lastLevel) {
+    // Edge: Taste wurde gerade gedrückt -> Display wecken, Interaktion starten
+    displayWake();
     b.pressedAt = now;
     b.lastRepeat = now;
     b.handled = false;
@@ -327,6 +367,8 @@ void setup() {
   sensors.setWaitForConversion(true);
 
   drawSplash();
+  displayIsOn = true;
+  lastInteractionAt = millis();
   delay(5000);
 }
 
@@ -336,6 +378,7 @@ void loop() {
   static Mode lastMode = Mode::AUTO;
 
   unsigned long now = millis();
+  updateDisplayPower(now);
 
   // Buttons (Setpoint)
   bool changed = false;
@@ -352,11 +395,15 @@ void loop() {
   // Modus & Regelung
   Mode mode = readModeSwitch();
   bool modeJustEntered = (mode != lastMode);
+  if (modeJustEntered) {
+    displayWake();
+  }
   controlLogic(mode, modeJustEntered);
   lastMode = mode;
 
   // Anzeige
-  if (changed || now - lastDraw > 200) {
+  if (displayIsOn &&
+      (changed || now - lastDraw > 200 || (now - lastInteractionAt) < 50)) {
     drawMain(mode, setpoint, lastTemp, relayState);
     lastDraw = now;
   }
