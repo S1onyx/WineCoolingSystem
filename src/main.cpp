@@ -12,8 +12,8 @@ constexpr int SCREEN_HEIGHT = 64;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
 // --------- Schalter / Buttons ---------
-constexpr uint8_t PIN_MODE_A = 32;   // links -> GND = OFF
-constexpr uint8_t PIN_MODE_B = 33;   // rechts -> GND = ON
+constexpr uint8_t PIN_MODE_A = 33;   // links -> GND = OFF
+constexpr uint8_t PIN_MODE_B = 32;   // rechts -> GND = ON
 constexpr uint8_t PIN_BTN_UP = 25;   // gegen GND
 constexpr uint8_t PIN_BTN_DOWN = 26; // gegen GND
 
