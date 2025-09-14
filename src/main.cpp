@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <DallasTemperature.h>
 #include <OneWire.h>
+#include <Preferences.h>
 #include <cstdint>
 
 // --------- OLED ---------
@@ -45,13 +46,49 @@ constexpr unsigned long COOLDOWN_MS = 120UL * 1000UL;     // 2 min
 
 enum class AutoState { OPEN, CLOSED };
 AutoState autoState = AutoState::CLOSED;
-unsigned long stateStartedAt = 0; // Zeitstempel Start des aktuellen Zustands
-unsigned long lastOpenAt = 0;     // Zeitstempel Beginn der letzten Öffnung
+unsigned long stateStartedAt = 0;
+unsigned long lastOpenAt = 0;
 
 // --------- DISPLAY: Auto-Off nach Inaktivität (2 min) ---------
 constexpr unsigned long DISPLAY_ON_TIMEOUT_MS = 120UL * 1000UL; // 2 min
 bool displayIsOn = true;
 unsigned long lastInteractionAt = 0;
+
+// --------- PERSISTENZ: Setpoint in NVS speichern ---------
+Preferences prefs;
+constexpr const char *NVS_NS = "winectrl";
+constexpr const char *NVS_KEY_SETPOINT = "sp";
+bool setpointDirty = false;
+unsigned long lastSetpointChangeAt = 0;
+constexpr unsigned long SETPOINT_SAVE_DELAY_MS =
+    1500; // 1.5 s nach letzter Änderung
+
+void saveSetpoint() {
+  if (!isnan(setpoint)) {
+    prefs.begin(NVS_NS, false);
+    prefs.putFloat(NVS_KEY_SETPOINT, setpoint);
+    prefs.end();
+    setpointDirty = false;
+  }
+}
+void loadSetpoint() {
+  prefs.begin(NVS_NS, true);
+  float v =
+      prefs.getFloat(NVS_KEY_SETPOINT, NAN); // NAN = kein gespeicherter Wert
+  prefs.end();
+  if (!isnan(v)) {
+    setpoint = v;
+    if (setpoint < SET_MIN)
+      setpoint = SET_MIN;
+    if (setpoint > SET_MAX)
+      setpoint = SET_MAX;
+  }
+}
+void maybePersistSetpoint(unsigned long now) {
+  if (setpointDirty && (now - lastSetpointChangeAt) >= SETPOINT_SAVE_DELAY_MS) {
+    saveSetpoint();
+  }
+}
 
 void displayWake();
 void displaySleep();
@@ -60,7 +97,6 @@ void updateDisplayPower(unsigned long now);
 // =====================================================================
 //                          KALIBRIERUNG IM CODE
 // =====================================================================
-// Default: keine Kalibrierung (Identität)
 static const int CAL_COUNT = 0;
 static const float CAL_RAW[] = {};
 static const float CAL_REF[] = {};
@@ -96,10 +132,8 @@ float applyCalibration(float raw) {
 // =====================================================================
 void displayWake() {
   if (!displayIsOn) {
-    // Einschalten des Panels
     display.ssd1306_command(SSD1306_DISPLAYON);
     displayIsOn = true;
-    // optional: Display puffern leeren & sofort neu zeichnen übernimmt loop()
   }
   lastInteractionAt = millis();
 }
@@ -164,7 +198,7 @@ inline bool shouldOpenNow() {
 void startOpen(unsigned long now) {
   autoState = AutoState::OPEN;
   stateStartedAt = now;
-  lastOpenAt = now; // Cooldown ab Start der Öffnung messen
+  lastOpenAt = now; // Cooldown ab Start der Öffnung
   relayWrite(true);
 }
 void startClosed(unsigned long now) {
@@ -178,12 +212,8 @@ void controlLogicTimedAuto(bool modeJustEntered) {
   unsigned long now = millis();
 
   if (modeJustEntered) {
-    // Beim Eintritt in AUTO sofortiges Öffnen erlauben, wenn es zu kalt ist:
-    // Cooldown künstlich abgelaufen setzen
     lastOpenAt = (now >= COOLDOWN_MS) ? (now - COOLDOWN_MS) : 0;
     startClosed(now);
-
-    // Direkt prüfen: zu kalt? -> sofort öffnen
     if (shouldOpenNow() && cooldownOver(now)) {
       startOpen(now);
     }
@@ -192,20 +222,14 @@ void controlLogicTimedAuto(bool modeJustEntered) {
 
   switch (autoState) {
   case AutoState::CLOSED: {
-    // Dauerhaft messen: sobald zu kalt UND Cooldown vorbei -> sofort öffnen
-    if (cooldownOver(now) && shouldOpenNow()) {
+    if (cooldownOver(now) && shouldOpenNow())
       startOpen(now);
-    }
-    // sonst geschlossen lassen
     break;
   }
-
   case AutoState::OPEN: {
-    // Immer mindestens 10 s offen bleiben (nie früher schließen)
     bool timeUp = (now - stateStartedAt) >= OPEN_DURATION_MS;
-    if (timeUp) {
+    if (timeUp)
       startClosed(now);
-    }
     break;
   }
   }
@@ -259,9 +283,8 @@ void drawSplash() {
 }
 
 void drawMain(Mode m, float sp, float t, bool relay) {
-  if (!displayIsOn) {
-    return; // Nichts zeichnen, wenn Display schlafend ist
-  }
+  if (!displayIsOn)
+    return;
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
 
@@ -325,7 +348,6 @@ bool handleButton(Btn &b, float delta) {
   bool changed = false;
 
   if (!level && b.lastLevel) {
-    // Edge: Taste wurde gerade gedrückt -> Display wecken, Interaktion starten
     displayWake();
     b.pressedAt = now;
     b.lastRepeat = now;
@@ -346,6 +368,12 @@ bool handleButton(Btn &b, float delta) {
     }
   }
   b.lastLevel = level;
+
+  // Persistenz: Änderung merken und später speichern
+  if (changed) {
+    setpointDirty = true;
+    lastSetpointChangeAt = now;
+  }
   return changed;
 }
 
@@ -366,6 +394,9 @@ void setup() {
   sensors.setResolution(dsAddr, 12);
   sensors.setWaitForConversion(true);
 
+  // Gespeicherten Sollwert laden
+  loadSetpoint();
+
   drawSplash();
   displayIsOn = true;
   lastInteractionAt = millis();
@@ -385,7 +416,10 @@ void loop() {
   changed |= handleButton(btnUp, +SET_STEP);
   changed |= handleButton(btnDown, -SET_STEP);
 
-  // Temperatur 1x/s lesen und kalibrieren (dauerhaft messen)
+  // Entprelltes Speichern des Sollwerts
+  maybePersistSetpoint(now);
+
+  // Temperatur 1x/s lesen und kalibrieren
   if (now - lastTempPoll > 1000) {
     readTemperatureRaw();
     lastTemp = applyCalibration(lastTempRaw);
