@@ -6,75 +6,98 @@
 #include <Preferences.h>
 #include <cstdint>
 
-// --------- OLED ---------
+// OLED
 constexpr uint8_t OLED_ADDR = 0x3C;
 constexpr int SCREEN_WIDTH = 128;
 constexpr int SCREEN_HEIGHT = 64;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-// --------- Schalter / Buttons ---------
-constexpr uint8_t PIN_MODE_A = 33;   // links -> GND = OFF
-constexpr uint8_t PIN_MODE_B = 32;   // rechts -> GND = ON
-constexpr uint8_t PIN_BTN_UP = 25;   // gegen GND
-constexpr uint8_t PIN_BTN_DOWN = 26; // gegen GND
+// IO Pins
+constexpr uint8_t PIN_MODE_A = 33;   // left -> GND = OFF
+constexpr uint8_t PIN_MODE_B = 32;   // right -> GND = ON
+constexpr uint8_t PIN_BTN_UP = 25;   // to GND (active LOW)
+constexpr uint8_t PIN_BTN_DOWN = 26; // to GND (active LOW)
 
-// --------- Sensor / Relais ---------
+// Sensor & Relay
 constexpr uint8_t PIN_ONEWIRE = 4;       // DS18B20 Data
-constexpr uint8_t PIN_RELAY = 23;        // Relais IN
-constexpr bool RELAY_ACTIVE_HIGH = true; // viele 1-Kanal-Module sind active-LOW
+constexpr uint8_t PIN_RELAY = 23;        // Relay IN
+constexpr bool RELAY_ACTIVE_HIGH = true; // true if relay is active-HIGH (many are active-LOW)
 
 OneWire oneWire(PIN_ONEWIRE);
 DallasTemperature sensors(&oneWire);
 DeviceAddress dsAddr;
 
-// --------- Regelung / Anzeige ---------
+// Settings
+// setpoint step (°C)
 constexpr float SET_STEP = 0.1f;
 constexpr float SET_MIN = -20.0f;
 constexpr float SET_MAX = 80.0f;
+// hysteresis (°C)
 constexpr float HYST = 0.2f;
 
 enum class Mode { OFF, AUTO, ON };
+// raw
 float setpoint = 18.0f;
-float lastTempRaw = NAN; // unkalibriert
-float lastTemp = NAN;    // kalibriert
+float lastTempRaw = NAN;
+// filtered
+float lastTemp = NAN;
 bool relayState = false;
 
-// --------- AUTO: Zeit-Pulsbetrieb mit Cooldown (10 s offen, mind. 120 s zu)
-// ---------
-constexpr unsigned long OPEN_DURATION_MS = 10UL * 1000UL; // 10 s
-constexpr unsigned long COOLDOWN_MS = 120UL * 1000UL;     // 2 min
+// Mode
+Mode lastMode = Mode::AUTO;
+
+// Smoothing
+// 0..1 (higher = less smoothing)
+float emaTemp = NAN;
+constexpr float EMA_ALPHA = 0.25f;
+inline float smooth(float prev, float now) {
+  if (isnan(prev))
+    return now;
+  return prev + EMA_ALPHA * (now - prev);
+}
+
+// AUTO timing
+constexpr unsigned long OPEN_DURATION_MS = 10UL * 1000UL;
+constexpr unsigned long COOLDOWN_MS = 120UL * 1000UL;
 
 enum class AutoState { OPEN, CLOSED };
 AutoState autoState = AutoState::CLOSED;
 unsigned long stateStartedAt = 0;
 unsigned long lastOpenAt = 0;
 
-// --------- DISPLAY: Auto-Off nach Inaktivität (2 min) ---------
-constexpr unsigned long DISPLAY_ON_TIMEOUT_MS = 120UL * 1000UL; // 2 min
+// Display power
+constexpr unsigned long DISPLAY_ON_TIMEOUT_MS = 120UL * 1000UL;
 bool displayIsOn = true;
 unsigned long lastInteractionAt = 0;
 
-// --------- PERSISTENZ: Setpoint in NVS speichern ---------
+// Persistence
 Preferences prefs;
 constexpr const char *NVS_NS = "winectrl";
 constexpr const char *NVS_KEY_SETPOINT = "sp";
 bool setpointDirty = false;
 unsigned long lastSetpointChangeAt = 0;
 constexpr unsigned long SETPOINT_SAVE_DELAY_MS =
-    1500; // 1.5 s nach letzter Änderung
+    1500;
+
+constexpr float SP_SAVE_EPS = 0.05f;
+float lastSavedSetpoint = NAN;
 
 void saveSetpoint() {
   if (!isnan(setpoint)) {
-    prefs.begin(NVS_NS, false);
-    prefs.putFloat(NVS_KEY_SETPOINT, setpoint);
-    prefs.end();
-    setpointDirty = false;
+    if (isnan(lastSavedSetpoint) ||
+        fabsf(setpoint - lastSavedSetpoint) >= SP_SAVE_EPS) {
+      prefs.begin(NVS_NS, false);
+      prefs.putFloat(NVS_KEY_SETPOINT, setpoint);
+      prefs.end();
+      lastSavedSetpoint = setpoint;
+      setpointDirty = false;
+    }
   }
 }
 void loadSetpoint() {
   prefs.begin(NVS_NS, true);
   float v =
-      prefs.getFloat(NVS_KEY_SETPOINT, NAN); // NAN = kein gespeicherter Wert
+      prefs.getFloat(NVS_KEY_SETPOINT, NAN);
   prefs.end();
   if (!isnan(v)) {
     setpoint = v;
@@ -82,6 +105,7 @@ void loadSetpoint() {
       setpoint = SET_MIN;
     if (setpoint > SET_MAX)
       setpoint = SET_MAX;
+    lastSavedSetpoint = setpoint;
   }
 }
 void maybePersistSetpoint(unsigned long now) {
@@ -90,13 +114,8 @@ void maybePersistSetpoint(unsigned long now) {
   }
 }
 
-void displayWake();
-void displaySleep();
-void updateDisplayPower(unsigned long now);
-
-// =====================================================================
-//                          KALIBRIERUNG IM CODE
-// =====================================================================
+// Calibration
+// piecewise linear mapping
 static const int CAL_COUNT = 0;
 static const float CAL_RAW[] = {};
 static const float CAL_REF[] = {};
@@ -127,9 +146,7 @@ float applyCalibration(float raw) {
   return raw;
 }
 
-// =====================================================================
-//                         DISPLAY POWER CONTROL
-// =====================================================================
+// on
 void displayWake() {
   if (!displayIsOn) {
     display.ssd1306_command(SSD1306_DISPLAYON);
@@ -138,6 +155,7 @@ void displayWake() {
   lastInteractionAt = millis();
 }
 
+// off
 void displaySleep() {
   if (displayIsOn) {
     display.ssd1306_command(SSD1306_DISPLAYOFF);
@@ -153,14 +171,18 @@ void updateDisplayPower(unsigned long now) {
   }
 }
 
-Mode readModeSwitch() {
+// both LOW -> keep last
+Mode readModeSwitch(Mode lastKnown) {
   bool a = digitalRead(PIN_MODE_A);
   bool b = digitalRead(PIN_MODE_B);
   if (!a && b)
     return Mode::OFF;
   if (a && !b)
     return Mode::ON;
-  return Mode::AUTO;
+  if (a && b)
+    return Mode::AUTO; // middle
+  // both LOW -> keep last
+  return lastKnown;
 }
 
 void relayWrite(bool on) {
@@ -178,6 +200,7 @@ void clampSetpoint() {
     setpoint = SET_MAX;
 }
 
+// read latest (non-blocking)
 void readTemperatureRaw() {
   sensors.requestTemperatures();
   float t = NAN;
@@ -186,28 +209,33 @@ void readTemperatureRaw() {
   lastTempRaw = (t > -127.0f && t < 125.0f) ? t : NAN;
 }
 
-// --------- AUTO-Helfer ---------
+// AUTO helpers
+// cooldown done?
 inline bool cooldownOver(unsigned long now) {
   return (now - lastOpenAt) >= COOLDOWN_MS;
 }
+// below setpoint?
 inline bool shouldOpenNow() {
   if (isnan(lastTemp))
     return false;
   return lastTemp < (setpoint - HYST * 0.5f);
 }
+// OPEN + start cooldown
 void startOpen(unsigned long now) {
   autoState = AutoState::OPEN;
   stateStartedAt = now;
-  lastOpenAt = now; // Cooldown ab Start der Öffnung
+  lastOpenAt = now;
   relayWrite(true);
 }
+// CLOSED
 void startClosed(unsigned long now) {
   autoState = AutoState::CLOSED;
   stateStartedAt = now;
   relayWrite(false);
 }
 
-// --------- Steuerlogik ---------
+// Control
+// AUTO state machine
 void controlLogicTimedAuto(bool modeJustEntered) {
   unsigned long now = millis();
 
@@ -228,7 +256,7 @@ void controlLogicTimedAuto(bool modeJustEntered) {
   }
   case AutoState::OPEN: {
     bool timeUp = (now - stateStartedAt) >= OPEN_DURATION_MS;
-    if (timeUp)
+    if (timeUp || isnan(lastTemp))
       startClosed(now);
     break;
   }
@@ -238,9 +266,13 @@ void controlLogicTimedAuto(bool modeJustEntered) {
 void controlLogic(Mode mode, bool modeJustEntered) {
   switch (mode) {
   case Mode::OFF:
+    autoState = AutoState::CLOSED;
+    stateStartedAt = millis();
     relayWrite(false);
     break;
   case Mode::ON:
+    autoState = AutoState::CLOSED;
+    stateStartedAt = millis();
     relayWrite(true);
     break;
   case Mode::AUTO:
@@ -249,7 +281,7 @@ void controlLogic(Mode mode, bool modeJustEntered) {
   }
 }
 
-// Traube (nur Konturen)
+// UI icon
 void drawGrapeOutline(int16_t x, int16_t y) {
   display.drawCircle(x + 6, y + 10, 4, SSD1306_WHITE);
   display.drawCircle(x + 12, y + 10, 4, SSD1306_WHITE);
@@ -269,19 +301,20 @@ void drawSplash() {
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
   display.setCursor(0, 0);
-  display.println("Wine Cooling System");
+  display.println(F("Wine Cooling System"));
   display.setCursor(0, 12);
-  display.println("designed by");
+  display.println(F("designed by"));
   display.setCursor(0, 22);
-  display.println("Simon Riedinger");
+  display.println(F("Simon Riedinger"));
   display.setCursor(0, 36);
-  display.println("for");
+  display.println(F("for"));
   display.setCursor(0, 46);
-  display.println("Hannes Schock");
+  display.println(F("Hannes Schock"));
   drawGrapeOutline(92, 8);
   display.display();
 }
 
+// UI
 void drawMain(Mode m, float sp, float t, bool relay) {
   if (!displayIsOn)
     return;
@@ -290,46 +323,49 @@ void drawMain(Mode m, float sp, float t, bool relay) {
 
   display.setTextSize(2);
   display.setCursor(0, 0);
-  display.println("Controller");
+  display.println(F("Controller"));
 
   display.setTextSize(1);
   display.setCursor(0, 20);
-  display.print("Mode: ");
+  display.print(F("Mode: "));
   switch (m) {
   case Mode::OFF:
-    display.print("OFF");
+    display.print(F("OFF"));
     break;
   case Mode::AUTO:
-    display.print("AUTO");
+    display.print(F("AUTO"));
     break;
   case Mode::ON:
-    display.print("ON");
+    display.print(F("ON"));
     break;
   }
 
   display.setCursor(0, 32);
-  display.print("Set:  ");
+  display.print(F("Set:  "));
   display.printf("%.1f", sp);
   display.print((char)247);
-  display.print("C");
+  display.print(F("C"));
 
   display.setCursor(0, 44);
-  display.print("Temp: ");
-  if (isnan(t))
-    display.print("--.-");
-  else
+  display.print(F("Temp: "));
+  if (isnan(t)) {
+    display.print(F("--.-"));
+    display.setCursor(80, 44);
+    display.print(F("ERR"));
+  } else {
     display.printf("%.1f", t);
+  }
   display.print((char)247);
-  display.print("C");
+  display.print(F("C"));
 
   display.setCursor(0, 56);
-  display.print("Valve: ");
+  display.print(F("Valve: "));
   display.print(relay ? "OPEN" : "CLOSED");
 
   display.display();
 }
 
-// --------- Buttons für Setpoint (+/-) ---------
+// Buttons
 struct Btn {
   uint8_t pin;
   bool lastLevel = true;
@@ -343,33 +379,37 @@ Btn btnUp(PIN_BTN_UP);
 Btn btnDown(PIN_BTN_DOWN);
 
 bool handleButton(Btn &b, float delta) {
-  bool level = digitalRead(b.pin); // Pullup: LOW = gedrückt
+  bool level = digitalRead(b.pin); // pull-up: LOW = pressed
   unsigned long now = millis();
+  unsigned long held = now - b.pressedAt;
+  float step = delta; // step
+  if (held > 1200) {
+    step = (delta > 0 ? +1.0f : -1.0f); // fast
+  } else if (held > 600) {
+    step = (delta > 0 ? +0.5f : -0.5f); // medium
+  }
   bool changed = false;
 
   if (!level && b.lastLevel) {
-    if (!displayIsOn) {
-      // Wenn Display aus -> nur einschalten, keine Änderung
-      displayWake();
-      b.lastLevel = level;
-      return false; // keine Änderung am Setpoint
-    }
-    // Wenn Display an -> normal weiter
+    // wake only
     displayWake();
+    b.lastLevel = level;
+    if (!displayIsOn)
+      return false;
     b.pressedAt = now;
     b.lastRepeat = now;
     b.handled = false;
   }
 
-  if (!level && displayIsOn) { // Nur wenn Display an ist, darf geändert werden
+  if (!level && displayIsOn) { // only when display on
     if (!b.handled && now - b.pressedAt > 30) {
-      setpoint += delta;
+      setpoint += step;
       clampSetpoint();
       b.handled = true;
       changed = true;
     }
     if (now - b.pressedAt > 600 && now - b.lastRepeat > 120) {
-      setpoint += delta;
+      setpoint += step;
       clampSetpoint();
       b.lastRepeat = now;
       changed = true;
@@ -378,7 +418,7 @@ bool handleButton(Btn &b, float delta) {
 
   b.lastLevel = level;
 
-  // Persistenz: Änderung merken und später speichern
+  // mark for save
   if (changed) {
     setpointDirty = true;
     lastSetpointChangeAt = now;
@@ -386,9 +426,9 @@ bool handleButton(Btn &b, float delta) {
   return changed;
 }
 
-// --------- Setup / Loop ---------
+// Setup
 void setup() {
-  Wire.begin(); // I2C (SDA=21, SCL=22)
+  Wire.begin();
 
   display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
   pinMode(PIN_MODE_A, INPUT_PULLUP);
@@ -399,11 +439,13 @@ void setup() {
   relayWrite(false);
 
   sensors.begin();
-  sensors.getAddress(dsAddr, 0);
-  sensors.setResolution(dsAddr, 12);
-  sensors.setWaitForConversion(true);
+  bool hasAddr = sensors.getAddress(dsAddr, 0);
+  if (hasAddr) {
+    sensors.setResolution(dsAddr, 12);
+  }
+  sensors.setWaitForConversion(false);
 
-  // Gespeicherten Sollwert laden
+  // Load stored setpoint
   loadSetpoint();
 
   drawSplash();
@@ -412,31 +454,46 @@ void setup() {
   delay(5000);
 }
 
+// Loop
 void loop() {
   static unsigned long lastTempPoll = 0;
   static unsigned long lastDraw = 0;
-  static Mode lastMode = Mode::AUTO;
+
+  static float lastDrawnTemp = NAN, lastDrawnSp = NAN;
+  static bool lastDrawnRelay = false;
 
   unsigned long now = millis();
   updateDisplayPower(now);
 
-  // Buttons (Setpoint)
+  // Buttons (setpoint)
   bool changed = false;
   changed |= handleButton(btnUp, +SET_STEP);
   changed |= handleButton(btnDown, -SET_STEP);
 
-  // Entprelltes Speichern des Sollwerts
+  // save (debounced)
   maybePersistSetpoint(now);
 
-  // Temperatur 1x/s lesen und kalibrieren
-  if (now - lastTempPoll > 1000) {
-    readTemperatureRaw();
-    lastTemp = applyCalibration(lastTempRaw);
+  // Temperature measurement asynchronous and smoothing
+  static bool convRunning = false;
+  if (!convRunning && (now - lastTempPoll > 1000)) {
+    // start conversion ~1s
+    sensors.requestTemperatures();
+    convRunning = true;
     lastTempPoll = now;
+  } else if (convRunning && (now - lastTempPoll >= 800)) {
+    // small margin
+    float t = NAN;
+    if (sensors.getAddress(dsAddr, 0))
+      t = sensors.getTempC(dsAddr);
+    lastTempRaw = (t > -127.0f && t < 125.0f) ? t : NAN;
+    float calibrated = applyCalibration(lastTempRaw);
+    emaTemp = smooth(emaTemp, calibrated);
+    lastTemp = emaTemp;
+    convRunning = false;
   }
 
-  // Modus & Regelung
-  Mode mode = readModeSwitch();
+  // Mode & control
+  Mode mode = readModeSwitch(lastMode);
   bool modeJustEntered = (mode != lastMode);
   if (modeJustEntered) {
     displayWake();
@@ -444,10 +501,17 @@ void loop() {
   controlLogic(mode, modeJustEntered);
   lastMode = mode;
 
-  // Anzeige
-  if (displayIsOn &&
-      (changed || now - lastDraw > 200 || (now - lastInteractionAt) < 50)) {
+  bool needRedraw =
+      changed || relayState != lastDrawnRelay ||
+      (displayIsOn && (now - lastDraw > 250)) ||
+      (!isnan(lastTemp) && fabsf(lastTemp - lastDrawnTemp) >= 0.1f) ||
+      (fabsf(setpoint - lastDrawnSp) >= 0.1f) || (now - lastInteractionAt) < 50;
+
+  if (displayIsOn && needRedraw) {
     drawMain(mode, setpoint, lastTemp, relayState);
+    lastDrawnTemp = lastTemp;
+    lastDrawnSp = setpoint;
+    lastDrawnRelay = relayState;
     lastDraw = now;
   }
 
