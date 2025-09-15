@@ -13,15 +13,16 @@ constexpr int SCREEN_HEIGHT = 64;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
 // IO Pins
-constexpr uint8_t PIN_MODE_A = 33;   // left -> GND = OFF
-constexpr uint8_t PIN_MODE_B = 32;   // right -> GND = ON
+constexpr uint8_t PIN_MODE_A = 32;   // left -> GND = OFF
+constexpr uint8_t PIN_MODE_B = 33;   // right -> GND = ON
 constexpr uint8_t PIN_BTN_UP = 25;   // to GND (active LOW)
 constexpr uint8_t PIN_BTN_DOWN = 26; // to GND (active LOW)
 
 // Sensor & Relay
-constexpr uint8_t PIN_ONEWIRE = 4;       // DS18B20 Data
-constexpr uint8_t PIN_RELAY = 23;        // Relay IN
-constexpr bool RELAY_ACTIVE_HIGH = true; // true if relay is active-HIGH (many are active-LOW)
+constexpr uint8_t PIN_ONEWIRE = 4; // DS18B20 Data
+constexpr uint8_t PIN_RELAY = 23;  // Relay IN
+constexpr bool RELAY_ACTIVE_HIGH =
+    true; // true if relay is active-HIGH (many are active-LOW)
 
 OneWire oneWire(PIN_ONEWIRE);
 DallasTemperature sensors(&oneWire);
@@ -76,8 +77,7 @@ constexpr const char *NVS_NS = "winectrl";
 constexpr const char *NVS_KEY_SETPOINT = "sp";
 bool setpointDirty = false;
 unsigned long lastSetpointChangeAt = 0;
-constexpr unsigned long SETPOINT_SAVE_DELAY_MS =
-    1500;
+constexpr unsigned long SETPOINT_SAVE_DELAY_MS = 1500;
 
 constexpr float SP_SAVE_EPS = 0.05f;
 float lastSavedSetpoint = NAN;
@@ -96,8 +96,7 @@ void saveSetpoint() {
 }
 void loadSetpoint() {
   prefs.begin(NVS_NS, true);
-  float v =
-      prefs.getFloat(NVS_KEY_SETPOINT, NAN);
+  float v = prefs.getFloat(NVS_KEY_SETPOINT, NAN);
   prefs.end();
   if (!isnan(v)) {
     setpoint = v;
@@ -116,9 +115,9 @@ void maybePersistSetpoint(unsigned long now) {
 
 // Calibration
 // piecewise linear mapping
-static const int CAL_COUNT = 0;
-static const float CAL_RAW[] = {};
-static const float CAL_REF[] = {};
+static const int CAL_COUNT = 4;
+static const float CAL_RAW[] = {9.0f, 24.0f, 41.0f, 95.5f};
+static const float CAL_REF[] = {11.0f, 25.4f, 43.0f, 92.0f};
 
 float applyCalibration(float raw) {
   if (isnan(raw) || CAL_COUNT <= 0)
