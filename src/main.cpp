@@ -348,12 +348,20 @@ bool handleButton(Btn &b, float delta) {
   bool changed = false;
 
   if (!level && b.lastLevel) {
+    if (!displayIsOn) {
+      // Wenn Display aus -> nur einschalten, keine Änderung
+      displayWake();
+      b.lastLevel = level;
+      return false; // keine Änderung am Setpoint
+    }
+    // Wenn Display an -> normal weiter
     displayWake();
     b.pressedAt = now;
     b.lastRepeat = now;
     b.handled = false;
   }
-  if (!level) {
+
+  if (!level && displayIsOn) { // Nur wenn Display an ist, darf geändert werden
     if (!b.handled && now - b.pressedAt > 30) {
       setpoint += delta;
       clampSetpoint();
@@ -367,6 +375,7 @@ bool handleButton(Btn &b, float delta) {
       changed = true;
     }
   }
+
   b.lastLevel = level;
 
   // Persistenz: Änderung merken und später speichern
