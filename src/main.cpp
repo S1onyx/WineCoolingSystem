@@ -213,11 +213,11 @@ void readTemperatureRaw() {
 inline bool cooldownOver(unsigned long now) {
   return (now - lastOpenAt) >= COOLDOWN_MS;
 }
-// below setpoint?
+// Open valve when temperature exceeds setpoint + half hysteresis
 inline bool shouldOpenNow() {
   if (isnan(lastTemp))
     return false;
-  return lastTemp < (setpoint - HYST * 0.5f);
+  return lastTemp > (setpoint + HYST * 0.5f);
 }
 // OPEN + start cooldown
 void startOpen(unsigned long now) {
